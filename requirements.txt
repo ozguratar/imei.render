@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+undetected-chromedriver
+selenium
+google-generativeai
+pydantic
+beautifulsoup4
