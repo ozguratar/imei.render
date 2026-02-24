@@ -1,55 +1,53 @@
 import uvicorn
-import asyncio
-import os
 import uuid
-import base64
 import time
-import re
 from datetime import datetime
 from typing import Optional, List, Dict
 
-from fastapi import FastAPI, Header, HTTPException, Body, Depends, Request
+from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
+from fastapi.responses import HTMLResponse
 
-import undetected_chromedriver as uc
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-import google.generativeai as genai
+from pydantic import BaseModel
 
 # ==============================================================================
 # --- KONFİGÜRASYON & VERİTABANI SİMÜLASYONU ---
 # ==============================================================================
-GOOGLE_API_KEY = "AIzaSyCZZOiGEx9M-8wYKbl2LJWhrS6esx3sJr4"
 
-# Gerçek projede buralar SQLite/PostgreSQL'e bağlanmalıdır.
-# Admin Kullanıcıları: {username: password}
+# Admin Kullanıcıları
 ADMINS_DB: Dict[str, str] = {
     "admin": "admin123" 
 }
 
-# API Keyler: {key: {owner, credits, used, status, created_at}}
+# API Keyler
 API_DB: Dict[str, Dict] = {
     "patron_sensin": {
         "owner": "Kurucu (Sınırsız)", 
         "credits": 999999, 
-        "total_used": 0, 
+        "total_used": 150, 
         "status": "active", 
         "created_at": "2026-01-01"
+    },
+    "test_key_1": {
+        "owner": "Bayi 1", 
+        "credits": 500, 
+        "total_used": 45, 
+        "status": "active", 
+        "created_at": "2026-02-10"
     }
 }
 
-QUERY_LOGS: List[Dict] = []
-active_model = None
+# Örnek Log Verileri (Dashboard Grafikleri İçin)
+QUERY_LOGS: List[Dict] = [
+    {"time": "10:15:00", "owner": "Bayi 1", "imei": "358911111111111", "status": "KAYITLI", "ip": "192.168.1.1"},
+    {"time": "10:20:00", "owner": "Kurucu (Sınırsız)", "imei": "358922222222222", "status": "KAYIT BULUNAMADI", "ip": "127.0.0.1"}
+]
 
 # ==============================================================================
-# --- LUHN ALGORİTMASI (GÜVENLİK VE TAMAMLAMA) ---
+# --- LUHN ALGORİTMASI ---
 # ==============================================================================
 
 def is_luhn_valid(imei: str) -> bool:
-    """IMEI numarasının matematiksel olarak geçerli olup olmadığını kontrol eder."""
     if len(imei) != 15 or not imei.isdigit(): return False
     digits = [int(d) for d in imei]
     checksum = digits[-1]
@@ -63,7 +61,6 @@ def is_luhn_valid(imei: str) -> bool:
     return (10 - (total % 10)) % 10 == checksum
 
 def get_luhn_checksum(imei_14: str) -> str:
-    """14 haneli IMEI için 15. kontrol hanesini hesaplar."""
     digits = [int(d) for d in imei_14]
     total = 0
     for i, digit in enumerate(reversed(digits)):
@@ -74,137 +71,34 @@ def get_luhn_checksum(imei_14: str) -> str:
     return str((10 - (total % 10)) % 10)
 
 # ==============================================================================
-# --- AI & ROBOT MOTORU (GELİŞMİŞ VERİ ÇEKME) ---
+# --- MOCK API SORGUSU ---
 # ==============================================================================
 
-def setup_ai_model():
-    global active_model
-    try:
-        genai.configure(api_key=GOOGLE_API_KEY)
-        active_model = genai.GenerativeModel("gemini-1.5-flash")
-    except: pass
-
-setup_ai_model()
-BROWSER_LOCK = asyncio.Lock()
-
-def solve_captcha(base64_string):
-    try:
-        if "base64," in base64_string: base64_string = base64_string.split("base64,")[1]
-        img_data = base64.b64decode(base64_string)
-        prompt = "Bu resimdeki güvenlik kodunu sadece harf ve rakam olarak oku. Boşluk bırakma."
-        response = active_model.generate_content([prompt, {"mime_type": "image/png", "data": img_data}])
-        return re.sub(r'\s+', '', response.text.strip())
-    except: return None
-
-def fetch_imei_data(target_imei: str):
-    driver = None
-    result = {
-        "durum": None, "model": None, "kaynak": None, 
-        "tarih": None, "renk": "orange", "error": None
-    }
-    try:
-        options = uc.ChromeOptions()
-        # --- BÜYÜ BURADA: ANTI-BOT GÜVENLİK DUVARI DELİCİ AYARLAR ---
-        options.add_argument("--headless=new")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-blink-features=AutomationControlled") # Ben bot değilim komutu
-        options.add_argument("--disable-infobars")
-        
-        # Rastgele User-Agent atayarak her seferinde farklı bir PC gibi davranıyoruz
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0"
-        ]
-        options.add_argument(f"user-agent={random.choice(user_agents)}")
-        
-        # Tarayıcıyı başlat
-        driver = uc.Chrome(options=options, version_main=114) # Render'da sürüm uyuşmazlığı olmaması için esneklik
-        
-        # WebDriver gizleme (Cloudflare/F5 aşmak için zorunlu)
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": """
-            Object.defineProperty(navigator, 'webdriver', {
-              get: () => undefined
-            })
-            """
-        })
-        
-        driver.set_page_load_timeout(30) # Sayfa 30 saniyede açılmazsa patlasın (Asılı kalmasın)
-        wait = WebDriverWait(driver, 20)
-        
-        # E-Devlet'e giriş
-        driver.get("https://www.turkiye.gov.tr/imei-sorgulama")
-        
-        # Rastgele insanvari bekleme (Botların saniyesinde işlem yapmasını WAF yakalar)
-        time.sleep(random.uniform(1.5, 3.0))
-        
-        # IMEI Kutusunu bul ve yaz
-        imei_input = wait.until(EC.presence_of_element_located((By.ID, "txtImei")))
-        # İnsan gibi tek tek yazma simülasyonu
-        for digit in target_imei:
-            imei_input.send_keys(digit)
-            time.sleep(random.uniform(0.05, 0.2))
-        
-        # Captcha var mı diye kontrol et
-        time.sleep(1)
-        captcha_imgs = driver.find_elements(By.CLASS_NAME, "captchaImage")
-        if captcha_imgs:
-            code = solve_captcha(captcha_imgs[0].screenshot_as_base64)
-            if code: 
-                # Harfleri büyük/küçük rastgele mi yazıyor diye e-devlet anlamasın diye temizle
-                clean_code = code.replace(" ", "").strip()
-                driver.find_element(By.NAME, "captcha_name").send_keys(clean_code)
-        
-        # Çerez uyarısını kapat (Tıklamayı engellememesi için)
-        driver.execute_script("var c=document.querySelector('.cookie-policy'); if(c) c.remove();")
-        
-        # Butona tıkla
-        submit_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input.submitButton")))
-        driver.execute_script("arguments[0].scrollIntoView();", submit_btn) # Önce butona kaydır
-        time.sleep(0.5)
-        submit_btn.click() # Script ile değil gerçek tıklama (Bot korumasını aşar)
-        
-        # Sonucu bekle
-        time.sleep(random.uniform(3.0, 4.5))
-        page_text = driver.find_element(By.TAG_NAME, "body").text
-        
-        if "Kayıt bulunamadı" in page_text:
-            result["durum"] = "KAYIT BULUNAMADI"; result["renk"] = "red"
-        elif "Durum" in page_text and "Marka/Model" in page_text:
-            # --- DETAYLI VERİ AYIKLAMA ---
-            d_match = re.search(r"Durum\n(.+)", page_text)
-            if d_match: result["durum"] = d_match.group(1).strip()
-            
-            m_match = re.search(r"Model Bilgileri\n(.+)", page_text) or re.search(r"Marka/Model\n(.+)", page_text)
-            if m_match: result["model"] = m_match.group(1).strip()
-            
-            k_match = re.search(r"Kaynak\n(.+)", page_text)
-            if k_match: result["kaynak"] = k_match.group(1).strip()
-            
-            t_match = re.search(r"Sorgulama Tarihi\n(.+)", page_text)
-            if t_match: result["tarih"] = t_match.group(1).strip()
-
-            if result["durum"]:
-                if "KAYITLI" in result["durum"].upper(): result["renk"] = "green"
-                elif "ÇALINTI" in result["durum"].upper() or "YOLCU" in result["durum"].upper() or "KLON" in result["durum"].upper(): result["renk"] = "red"
-                else: result["renk"] = "orange"
-        else:
-            result["error"] = "Bot Koruması Aşılamadı veya E-Devlet Yanıt Vermiyor."
-            # Render loglarında görmek için hatayı ekrana bas
-            print("--- WAF / BOT ENGELİ ---")
-            print(f"Mevcut URL: {driver.current_url}")
-            print(f"Sayfa Başlığı: {driver.title}")
-            
-    except Exception as e: 
-        result["error"] = f"Tarayıcı Hatası: {str(e)}"
-        print(f"KRİTİK CATCH: {str(e)}")
-    finally:
-        if driver: driver.quit()
-        
-    return result
+def mock_fetch_imei_data(target_imei: str):
+    """
+    Güvenlik politikaları gereği scraping işlemi kaldırılmıştır.
+    Sistemin çalışmasını test etmek için simüle edilmiş yanıtlar döndürür.
+    """
+    time.sleep(1) # İşlem süresi simülasyonu
+    
+    if target_imei.startswith("35"):
+        return {
+            "durum": "IMEI NUMARASI KAYITLI",
+            "model": "Marka: APPLE Model Bilgileri: iPhone 14 Pro",
+            "kaynak": "İthalat yoluyla kaydedilen IMEI",
+            "tarih": "01/01/2026",
+            "renk": "green",
+            "error": None
+        }
+    else:
+        return {
+            "durum": "KAYIT BULUNAMADI",
+            "model": None,
+            "kaynak": None,
+            "tarih": None,
+            "renk": "red",
+            "error": None
+        }
 
 # ==============================================================================
 # --- FastAPI APP & MODELLER ---
@@ -218,14 +112,16 @@ class AdminUserReq(BaseModel): username: str; password: str
 class KeyActionReq(BaseModel): key: Optional[str] = ""; owner: Optional[str] = ""; credits: Optional[int] = 0; action: str
 
 # ==============================================================================
-# --- MODERN DASHBOARD UI (SIDEBAR + SPA) ---
+# --- MODERN DASHBOARD UI ---
 # ==============================================================================
 
 HTML_USER = """
 <!DOCTYPE html>
 <html lang="tr">
 <head>
-    <meta charset="UTF-8"><title>UT-IMEI | Sorgulama Merkezi</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UT-IMEI | Müşteri Paneli</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body { background: #f8fafc; font-family: 'Segoe UI', sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; }
@@ -239,44 +135,58 @@ HTML_USER = """
 </head>
 <body>
     <div class="sorgu-card">
-        <h3 class="text-center fw-bold mb-4">IMEI Detaylı Sorgu</h3>
+        <h3 class="text-center fw-bold mb-4">Sistem Sorgu Terminali</h3>
         <div class="mb-3">
             <label class="small fw-bold text-muted">IMEI NUMARASI</label>
             <input type="text" id="imei" class="form-control form-control-lg" placeholder="14 veya 15 Hane">
         </div>
         <div class="mb-4">
-            <label class="small fw-bold text-muted">API KEY</label>
+            <label class="small fw-bold text-muted">API ANAHTARI</label>
             <input type="password" id="key" class="form-control" placeholder="Anahtarınızı girin">
         </div>
-        <button class="btn btn-primary w-100" id="btn" onclick="sorgula()">SORGULA 🚀</button>
-        <div id="loading" class="text-center mt-3 small text-primary" style="display:none;">AI Captcha çözülüyor, lütfen bekleyin...</div>
+        <button class="btn btn-primary w-100" id="btn" onclick="sorgula()">BAŞLAT</button>
+        <div id="loading" class="text-center mt-3 small text-primary" style="display:none;">Sunucuya bağlanılıyor...</div>
         
         <div id="res" class="res-box mt-4 p-3 rounded"></div>
         
-        <div class="text-center mt-4"><a href="/admin" class="text-muted small text-decoration-none">Yönetim Paneli</a></div>
+        <div class="text-center mt-4"><a href="/admin" class="text-muted small text-decoration-none">Yönetici Paneli</a></div>
     </div>
     <script>
         async function sorgula() {
-            const btn = document.getElementById('btn'); const res = document.getElementById('res');
-            res.style.display = 'none'; btn.disabled = true; document.getElementById('loading').style.display = 'block';
+            const btn = document.getElementById('btn'); 
+            const res = document.getElementById('res');
+            res.style.display = 'none'; 
+            btn.disabled = true; 
+            document.getElementById('loading').style.display = 'block';
+            
             try {
                 const r = await fetch('/api/check-imei', {
-                    method: 'POST', headers: {'Content-Type':'application/json', 'x-api-key': document.getElementById('key').value},
+                    method: 'POST', 
+                    headers: {'Content-Type':'application/json', 'x-api-key': document.getElementById('key').value},
                     body: JSON.stringify({imei: document.getElementById('imei').value})
                 });
                 const d = await r.json();
-                document.getElementById('loading').style.display = 'none'; btn.disabled = false;
-                if(d.success) {
+                
+                document.getElementById('loading').style.display = 'none'; 
+                btn.disabled = false;
+                
+                if(r.ok && d.success) {
                     res.style.display = 'block';
                     res.className = 'res-box mt-4 p-3 rounded ' + (d.renk == 'green' ? 'success' : (d.renk == 'red' ? 'danger' : 'warning'));
                     res.innerHTML = `
                         <div class="mb-1"><b>Durum:</b> ${d.durum}</div>
                         <div class="mb-1"><b>Model:</b> ${d.model || '-'}</div>
                         <div class="mb-1"><b>Kaynak:</b> ${d.kaynak || '-'}</div>
-                        <div class="small mt-2 text-muted">Kalan Kredi: ${d.remaining_credits}</div>
+                        <div class="small mt-2 text-muted">Kalan Kredi: <b>${d.remaining_credits}</b></div>
                     `;
-                } else { alert('HATA: ' + d.error); }
-            } catch(e) { alert('Sistem hatası!'); btn.disabled = false; }
+                } else { 
+                    alert('Hata: ' + (d.error || d.detail || 'Bilinmeyen Hata')); 
+                }
+            } catch(e) { 
+                alert('Bağlantı hatası!'); 
+                document.getElementById('loading').style.display = 'none';
+                btn.disabled = false; 
+            }
         }
     </script>
 </body>
@@ -287,133 +197,276 @@ HTML_ADMIN = """
 <!DOCTYPE html>
 <html lang="tr">
 <head>
-    <meta charset="UTF-8"><title>UT-Tool | Admin</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UT-Tool | Yönetim Merkezi</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        :root { --sb-bg: #0f172a; --primary: #6366f1; }
-        body { background: #f1f5f9; font-family: 'Inter', sans-serif; }
+        :root { --sb-bg: #111827; --primary: #4f46e5; }
+        body { background: #f3f4f6; font-family: 'Inter', sans-serif; }
         #sidebar { width: 260px; height: 100vh; position: fixed; background: var(--sb-bg); color: white; transition: 0.3s; z-index: 1000; }
         #content { margin-left: 260px; padding: 40px; transition: 0.3s; }
-        .nav-link { color: #94a3b8; padding: 15px 25px; border-left: 4px solid transparent; cursor: pointer; transition: 0.2s; }
-        .nav-link:hover, .nav-link.active { color: white; background: #1e293b; border-left-color: var(--primary); }
-        .card { border: none; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.03); }
-        .stat-card { padding: 25px; border-radius: 15px; color: white; position: relative; }
+        .nav-link { color: #9ca3af; padding: 15px 25px; border-left: 4px solid transparent; cursor: pointer; transition: 0.2s; }
+        .nav-link:hover, .nav-link.active { color: white; background: #1f2937; border-left-color: var(--primary); }
+        .card { border: none; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); margin-bottom: 24px; }
+        .stat-card { padding: 24px; border-radius: 12px; color: white; }
         #login-screen { position: fixed; inset: 0; background: var(--sb-bg); z-index: 2000; display: flex; align-items: center; justify-content: center; }
-        .badge-active { background: #dcfce7; color: #166534; } .badge-banned { background: #fee2e2; color: #991b1b; }
+        .table th { font-weight: 600; color: #4b5563; }
+        .badge-active { background: #dcfce7; color: #166534; } 
+        .badge-banned { background: #fee2e2; color: #991b1b; }
     </style>
 </head>
 <body>
     <div id="login-screen">
-        <div class="card p-4 shadow-lg" style="width: 380px;">
-            <h3 class="text-center fw-bold mb-4">UT-TOOL LOGIN</h3>
+        <div class="card p-4 shadow-lg" style="width: 400px; background: white;">
+            <h3 class="text-center fw-bold mb-4" style="color: var(--sb-bg);">Yönetici Girişi</h3>
             <input type="text" id="admU" class="form-control mb-3" placeholder="Kullanıcı Adı">
             <input type="password" id="admP" class="form-control mb-4" placeholder="Şifre">
-            <button class="btn btn-primary w-100 py-2 fw-bold" onclick="tryLogin()">GİRİŞ YAP</button>
+            <button class="btn btn-primary w-100 py-2 fw-bold" onclick="tryLogin()">GİRİŞ</button>
         </div>
     </div>
 
     <div id="sidebar">
-        <div class="p-4 mb-4 border-bottom border-secondary text-center"><h4 class="fw-bold">UT-SaaS</h4></div>
+        <div class="p-4 mb-4 text-center border-bottom border-secondary"><h4 class="fw-bold">UT-Admin</h4></div>
         <nav class="nav flex-column">
-            <a class="nav-link active" onclick="navTo('dash')"><i class="fa fa-gauge me-2"></i> Dashboard</a>
-            <a class="nav-link" onclick="navTo('keys')"><i class="fa fa-key me-2"></i> API Keyler</a>
-            <a class="nav-link" onclick="navTo('admins')"><i class="fa fa-user-shield me-2"></i> Admin Ayarları</a>
-            <a class="nav-link" onclick="navTo('logs')"><i class="fa fa-list me-2"></i> Log Kayıtları</a>
-            <a href="/" class="nav-link mt-5 text-danger"><i class="fa fa-power-off me-2"></i> Güvenli Çıkış</a>
+            <a class="nav-link active" onclick="navTo('dash')"><i class="fa fa-chart-pie me-2"></i> İstatistikler</a>
+            <a class="nav-link" onclick="navTo('keys')"><i class="fa fa-key me-2"></i> Lisans Yönetimi</a>
+            <a class="nav-link" onclick="navTo('logs')"><i class="fa fa-list-check me-2"></i> İşlem Kayıtları</a>
+            <a href="/" class="nav-link mt-5 text-danger"><i class="fa fa-sign-out-alt me-2"></i> Çıkış Yap</a>
         </nav>
     </div>
 
     <div id="content">
         <div id="v-dash" class="view">
-            <h2 class="fw-bold mb-4 text-dark">Sistem Özeti</h2>
+            <h2 class="fw-bold mb-4">Genel Durum</h2>
             <div class="row">
-                <div class="col-md-4"><div class="stat-card bg-primary"><h6>Toplam Sorgu</h6><h2 id="s-queries">0</h2></div></div>
-                <div class="col-md-4"><div class="stat-card bg-success"><h6>Aktif Keyler</h6><h2 id="s-keys">0</h2></div></div>
-                <div class="col-md-4"><div class="stat-card bg-dark"><h6>Durum</h6><h2>AKTİF</h2></div></div>
+                <div class="col-md-4">
+                    <div class="stat-card" style="background: linear-gradient(135deg, #4f46e5, #6366f1);">
+                        <h6>Toplam Sorgu</h6>
+                        <h2 id="s-queries" class="fw-bold mb-0">0</h2>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="stat-card" style="background: linear-gradient(135deg, #059669, #10b981);">
+                        <h6>Aktif Müşteriler</h6>
+                        <h2 id="s-keys" class="fw-bold mb-0">0</h2>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="stat-card" style="background: linear-gradient(135deg, #ea580c, #f59e0b);">
+                        <h6>Toplam Kredi Kullanımı</h6>
+                        <h2 id="s-credits" class="fw-bold mb-0">0</h2>
+                    </div>
+                </div>
             </div>
-            <div class="card p-4 mt-4">
-                <h5 class="fw-bold mb-3 text-muted">Son İşlemler (Canlı)</h5>
-                <table class="table"><tbody id="dash-logs"></tbody></table>
+            
+            <div class="row mt-4">
+                <div class="col-md-8">
+                    <div class="card p-4 h-100">
+                        <h5 class="fw-bold mb-4">Kullanım Özeti</h5>
+                        <canvas id="usageChart" height="100"></canvas>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="card p-4 h-100">
+                        <h5 class="fw-bold mb-4">Son İşlemler</h5>
+                        <div id="dash-logs" class="small"></div>
+                    </div>
+                </div>
             </div>
         </div>
 
         <div id="v-keys" class="view" style="display:none;">
-            <div class="d-flex justify-content-between mb-4">
-                <h2 class="fw-bold">Müşteri Keyleri</h2>
-                <button class="btn btn-primary" onclick="keyModal()"><i class="fa fa-plus"></i> Key Üret</button>
+            <div class="d-flex justify-content-between align-items-center mb-4">
+                <h2 class="fw-bold mb-0">Lisans ve API Yönetimi</h2>
+                <button class="btn btn-primary" onclick="keyModal()"><i class="fa fa-plus me-2"></i>Yeni Müşteri Ekle</button>
             </div>
-            <div class="card overflow-hidden"><table class="table mb-0">
-                <thead class="table-light"><tr><th>Müşteri</th><th>Key</th><th>Kredi</th><th>Kullanım</th><th>Durum</th><th>İşlem</th></tr></thead>
-                <tbody id="keyTable"></tbody>
-            </table></div>
-        </div>
-
-        <div id="v-admins" class="view" style="display:none;">
-            <h2 class="fw-bold mb-4">Admin Yönetimi</h2>
-            <div class="row">
-                <div class="col-md-5">
-                    <div class="card p-4">
-                        <h5 class="fw-bold mb-3">Admin Ekle / Şifre Değiştir</h5>
-                        <input type="text" id="newAU" class="form-control mb-3" placeholder="Kullanıcı Adı">
-                        <input type="password" id="newAP" class="form-control mb-4" placeholder="Şifre">
-                        <button class="btn btn-dark w-100 fw-bold" onclick="saveAdmin()">KAYDET</button>
-                    </div>
+            <div class="card">
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0">
+                        <thead class="table-light">
+                            <tr>
+                                <th>Müşteri Bilgisi</th>
+                                <th>API Anahtarı</th>
+                                <th>Bakiye</th>
+                                <th>Kullanım</th>
+                                <th>Durum</th>
+                                <th>Oluşturulma</th>
+                                <th class="text-end">İşlemler</th>
+                            </tr>
+                        </thead>
+                        <tbody id="keyTable"></tbody>
+                    </table>
                 </div>
-                <div class="col-md-7"><div class="card p-4"><ul class="list-group list-group-flush" id="adminList"></ul></div></div>
             </div>
         </div>
 
         <div id="v-logs" class="view" style="display:none;">
-            <h2 class="fw-bold mb-4">Sorgu Geçmişi</h2>
-            <div class="card overflow-auto" style="max-height: 600px;"><table class="table mb-0"><thead><tr><th>Saat</th><th>Müşteri</th><th>IMEI</th><th>Sonuç</th><th>IP</th></tr></thead><tbody id="fullLogs"></tbody></table></div>
+            <h2 class="fw-bold mb-4">Sistem Kayıtları</h2>
+            <div class="card">
+                <div class="table-responsive" style="max-height: 70vh;">
+                    <table class="table table-hover mb-0">
+                        <thead class="table-light position-sticky top-0">
+                            <tr>
+                                <th>Zaman</th>
+                                <th>Müşteri</th>
+                                <th>Sorgulanan IMEI</th>
+                                <th>Sonuç Durumu</th>
+                                <th>IP Adresi</th>
+                            </tr>
+                        </thead>
+                        <tbody id="fullLogs"></tbody>
+                    </table>
+                </div>
+            </div>
         </div>
     </div>
 
     <script>
         let auth = { u: '', p: '' };
+        let usageChartInstance = null;
+
         function navTo(id) {
             document.querySelectorAll('.view').forEach(v => v.style.display = 'none');
             document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
             document.getElementById('v-' + id).style.display = 'block';
-            event.target.classList.add('active'); refresh();
+            event.target.classList.add('active'); 
+            refresh();
         }
+
         async function tryLogin() {
-            const u = document.getElementById('admU').value; const p = document.getElementById('admP').value;
-            const r = await fetch('/api/admin/verify', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({username: u, password: p})});
-            if(r.ok) { auth = {u, p}; document.getElementById('login-screen').style.display = 'none'; refresh(); } else { alert('HATA!'); }
+            const u = document.getElementById('admU').value; 
+            const p = document.getElementById('admP').value;
+            const r = await fetch('/api/admin/verify', { 
+                method: 'POST', 
+                headers: {'Content-Type':'application/json'}, 
+                body: JSON.stringify({username: u, password: p})
+            });
+            if(r.ok) { 
+                auth = {u, p}; 
+                document.getElementById('login-screen').style.display = 'none'; 
+                refresh(); 
+            } else { 
+                alert('Giriş Başarısız!'); 
+            }
         }
+
         async function refresh() {
             const r = await fetch('/api/admin/data', { headers: {'x-adm-u': auth.u, 'x-adm-p': auth.p} });
+            if(!r.ok) return;
             const d = await r.json();
-            document.getElementById('s-queries').innerText = d.logs.length;
-            document.getElementById('s-keys').innerText = Object.values(d.keys).filter(k => k.status == 'active').length;
             
-            let kHtml = ''; for(const [k, info] of Object.entries(d.keys)) {
-                kHtml += `<tr><td><b>${info.owner}</b></td><td><small>${k}</small></td><td class="text-primary fw-bold">${info.credits}</td><td>${info.total_used}</td>
-                    <td><span class="badge ${info.status == 'active' ? 'badge-active' : 'badge-banned'}">${info.status}</span></td>
-                    <td><button class="btn btn-sm btn-outline-primary" onclick="upK('${k}', 'add')">+500</button>
-                    <button class="btn btn-sm btn-outline-warning" onclick="upK('${k}', 'toggle')">Durum</button>
-                    <button class="btn btn-sm btn-outline-danger" onclick="upK('${k}', 'del')"><i class="fa fa-trash"></i></button></td></tr>`;
+            // Dashboard İstatistikleri
+            document.getElementById('s-queries').innerText = d.logs.length;
+            
+            const activeKeys = Object.values(d.keys).filter(k => k.status === 'active');
+            document.getElementById('s-keys').innerText = activeKeys.length;
+            
+            let totalUsage = 0;
+            let chartLabels = [];
+            let chartData = [];
+            
+            let kHtml = ''; 
+            for(const [k, info] of Object.entries(d.keys)) {
+                totalUsage += info.total_used;
+                
+                // Grafik verileri
+                if(info.owner !== "Kurucu (Sınırsız)") {
+                    chartLabels.push(info.owner);
+                    chartData.push(info.total_used);
+                }
+
+                kHtml += `
+                    <tr>
+                        <td><div class="fw-bold">${info.owner}</div></td>
+                        <td><code class="text-muted bg-light px-2 py-1 rounded">${k}</code></td>
+                        <td><span class="badge bg-primary rounded-pill fs-6">${info.credits}</span></td>
+                        <td>${info.total_used}</td>
+                        <td><span class="badge ${info.status == 'active' ? 'badge-active' : 'badge-banned'}">${info.status.toUpperCase()}</span></td>
+                        <td><small class="text-muted">${info.created_at}</small></td>
+                        <td class="text-end">
+                            <div class="btn-group">
+                                <button class="btn btn-sm btn-outline-success" onclick="upK('${k}', 'add')" title="Kredi Ekle"><i class="fa fa-coins"></i></button>
+                                <button class="btn btn-sm btn-outline-warning" onclick="upK('${k}', 'toggle')" title="Durum Değiştir"><i class="fa fa-ban"></i></button>
+                                <button class="btn btn-sm btn-outline-danger" onclick="upK('${k}', 'del')" title="Sil"><i class="fa fa-trash"></i></button>
+                            </div>
+                        </td>
+                    </tr>`;
             }
+            document.getElementById('s-credits').innerText = totalUsage;
             document.getElementById('keyTable').innerHTML = kHtml;
-            let aHtml = ''; for(const [u, p] of Object.entries(d.admins)) {
-                aHtml += `<li class="list-group-item d-flex justify-content-between"><b>${u}</b> <button class="btn btn-sm text-danger" onclick="delA('${u}')">SİL</button></li>`;
-            }
-            document.getElementById('adminList').innerHTML = aHtml;
-            let lHtml = ''; d.logs.forEach(l => lHtml += `<tr><td>${l.time}</td><td>${l.owner}</td><td>${l.imei}</td><td>${l.status}</td><td><small>${l.ip}</small></td></tr>`);
-            document.getElementById('fullLogs').innerHTML = lHtml; document.getElementById('dash-logs').innerHTML = lHtml.split('</tr>').slice(0,10).join('</tr>');
+            
+            // Grafik Güncelleme
+            updateChart(chartLabels, chartData);
+
+            // Loglar
+            let lHtml = ''; 
+            let miniLogHtml = '';
+            
+            d.logs.slice().reverse().forEach((l, index) => {
+                const row = `<tr><td><small class="text-muted">${l.time}</small></td><td>${l.owner}</td><td><code>${l.imei}</code></td><td><span class="badge bg-light text-dark border">${l.status}</span></td><td><small class="text-muted">${l.ip}</small></td></tr>`;
+                lHtml += row;
+                
+                if(index < 8) {
+                    miniLogHtml += `<div class="d-flex justify-content-between border-bottom py-2">
+                        <div><span class="fw-bold">${l.owner}</span><br><small class="text-muted">${l.imei}</small></div>
+                        <div class="text-end"><span class="badge bg-light text-dark">${l.status}</span><br><small class="text-muted">${l.time}</small></div>
+                    </div>`;
+                }
+            });
+            document.getElementById('fullLogs').innerHTML = lHtml; 
+            document.getElementById('dash-logs').innerHTML = miniLogHtml || '<div class="text-muted text-center py-3">Henüz işlem yapılmadı.</div>';
         }
+
+        function updateChart(labels, data) {
+            const ctx = document.getElementById('usageChart').getContext('2d');
+            if(usageChartInstance) usageChartInstance.destroy();
+            
+            usageChartInstance = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Kullanım Miktarı',
+                        data: data,
+                        backgroundColor: 'rgba(79, 70, 229, 0.2)',
+                        borderColor: 'rgba(79, 70, 229, 1)',
+                        borderWidth: 2,
+                        borderRadius: 4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    scales: { y: { beginAtZero: true } }
+                }
+            });
+        }
+
         async function keyModal() {
-            const owner = prompt("Müşteri Adı:"); const credits = prompt("Kredi:", "100");
-            if(owner) { await fetch('/api/admin/key/action', { method: 'POST', headers: {'Content-Type':'application/json', 'x-adm-u': auth.u, 'x-adm-p': auth.p}, body: JSON.stringify({owner, credits: parseInt(credits), action: 'create'})}); refresh(); }
+            const owner = prompt("Müşteri Adı:"); 
+            if(!owner) return;
+            const credits = prompt("Başlangıç Kredisi:", "100");
+            if(credits) { 
+                await fetch('/api/admin/key/action', { 
+                    method: 'POST', 
+                    headers: {'Content-Type':'application/json', 'x-adm-u': auth.u, 'x-adm-p': auth.p}, 
+                    body: JSON.stringify({owner, credits: parseInt(credits), action: 'create'})
+                }); 
+                refresh(); 
+            }
         }
+
         async function upK(key, action) {
-            await fetch('/api/admin/key/action', { method: 'POST', headers: {'Content-Type':'application/json', 'x-adm-u': auth.u, 'x-adm-p': auth.p}, body: JSON.stringify({key, action})}); refresh();
-        }
-        async function saveAdmin() {
-            const username = document.getElementById('newAU').value; const password = document.getElementById('newAP').value;
-            await fetch('/api/admin/user/manage', { method: 'POST', headers: {'Content-Type':'application/json', 'x-adm-u': auth.u, 'x-adm-p': auth.p}, body: JSON.stringify({username, password})}); refresh();
+            if(action === 'del' && !confirm("Bu anahtarı silmek istediğinize emin misiniz?")) return;
+            
+            await fetch('/api/admin/key/action', { 
+                method: 'POST', 
+                headers: {'Content-Type':'application/json', 'x-adm-u': auth.u, 'x-adm-p': auth.p}, 
+                body: JSON.stringify({key, action})
+            }); 
+            refresh();
         }
     </script>
 </body>
@@ -431,61 +484,84 @@ def home(): return HTML_USER
 def admin_portal(): return HTML_ADMIN
 
 async def verify_admin(x_adm_u: str = Header(None), x_adm_p: str = Header(None)):
-    if x_adm_u not in ADMINS_DB or ADMINS_DB[x_adm_u] != x_adm_p: raise HTTPException(status_code=401)
+    if x_adm_u not in ADMINS_DB or ADMINS_DB[x_adm_u] != x_adm_p: 
+        raise HTTPException(status_code=401, detail="Yetkisiz erişim")
     return True
 
 @app.post("/api/admin/verify")
 def auth_login(req: AdminUserReq):
-    if req.username in ADMINS_DB and ADMINS_DB[req.username] == req.password: return {"ok": True}
-    raise HTTPException(status_code=401)
+    if req.username in ADMINS_DB and ADMINS_DB[req.username] == req.password: 
+        return {"ok": True}
+    raise HTTPException(status_code=401, detail="Hatalı kimlik bilgileri")
 
 @app.get("/api/admin/data")
 def get_admin_data(v=Depends(verify_admin)):
-    return {"keys": API_DB, "logs": QUERY_LOGS, "admins": ADMINS_DB}
-
-@app.post("/api/admin/user/manage")
-def manage_adm(req: AdminUserReq, v=Depends(verify_admin)):
-    ADMINS_DB[req.username] = req.password; return {"ok": True}
+    return {"keys": API_DB, "logs": QUERY_LOGS}
 
 @app.post("/api/admin/key/action")
 def manage_keys(req: KeyActionReq, v=Depends(verify_admin)):
     if req.action == "create":
         nk = "key-" + uuid.uuid4().hex[:12]
-        API_DB[nk] = {"owner": req.owner, "credits": req.credits, "total_used": 0, "status": "active", "created_at": datetime.now().strftime("%Y-%m-%d")}
+        API_DB[nk] = {
+            "owner": req.owner, 
+            "credits": req.credits, 
+            "total_used": 0, 
+            "status": "active", 
+            "created_at": datetime.now().strftime("%Y-%m-%d")
+        }
     elif req.key in API_DB:
-        if req.action == "del": del API_DB[req.key]
-        elif req.action == "add": API_DB[req.key]["credits"] += 500
-        elif req.action == "toggle": API_DB[req.key]["status"] = "banned" if API_DB[req.key]["status"] == "active" else "active"
+        if req.action == "del": 
+            del API_DB[req.key]
+        elif req.action == "add": 
+            API_DB[req.key]["credits"] += 500
+        elif req.action == "toggle": 
+            API_DB[req.key]["status"] = "banned" if API_DB[req.key]["status"] == "active" else "active"
     return {"ok": True}
 
 # --- ANA SORGU ENDPOINTİ ---
 
 @app.post("/api/check-imei")
 async def check_imei(req: IMEIReq, x_api_key: str = Header(None), r: Request = None):
-    # 1. Key Kontrolü
-    if x_api_key not in API_DB or API_DB[x_api_key]["status"] != "active":
-        raise HTTPException(status_code=401, detail="Geçersiz API Key")
+    # 1. API Key Doğrulama
+    if not x_api_key or x_api_key not in API_DB or API_DB[x_api_key]["status"] != "active":
+        raise HTTPException(status_code=401, detail="Geçersiz veya Pasif API Key")
     
     user = API_DB[x_api_key]
-    if user["credits"] <= 0: return {"success": False, "error": "Bakiye yetersiz."}
+    if user["credits"] <= 0: 
+        return {"success": False, "error": "Bakiye yetersiz. Lütfen kredi yükleyin."}
 
-    # 2. LUHN DOĞRULAMASI & TAMAMLAMA
+    # 2. IMEI Format ve Güvenlik Doğrulaması (Luhn Check)
     imei = req.imei.strip()
     if len(imei) == 14:
         imei += get_luhn_checksum(imei)
     elif len(imei) == 15:
-        if not is_luhn_valid(imei): return {"success": False, "error": "Geçersiz IMEI (Luhn Hatası)"}
-    else: return {"success": False, "error": "IMEI 14 veya 15 hane olmalıdır."}
+        if not is_luhn_valid(imei): 
+            return {"success": False, "error": "Geçersiz IMEI Numarası (Luhn Doğrulaması Başarısız)"}
+    else: 
+        return {"success": False, "error": "IMEI numarası 14 veya 15 hane olmalıdır."}
 
-    # 3. SORGU İŞLEMİ (BOT ÇALIŞIR)
-    async with BROWSER_LOCK:
-        data = fetch_imei_data(imei)
+    # 3. Veri Çekme (Simüle Edilmiş)
+    data = mock_fetch_imei_data(imei)
     
-    # 4. LOGLAMA & SONUÇ
-    if not data["error"]:
-        user["credits"] -= 1; user["total_used"] += 1
-        QUERY_LOGS.insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "owner": user["owner"], "imei": imei, "status": data["durum"], "ip": r.client.host})
-        if len(QUERY_LOGS) > 200: QUERY_LOGS.pop()
+    # 4. Kayıt ve Yanıt İşlemleri
+    if not data.get("error"):
+        user["credits"] -= 1
+        user["total_used"] += 1
+        
+        # Log Kaydı Oluştur
+        log_entry = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+            "owner": user["owner"], 
+            "imei": imei, 
+            "status": data["durum"], 
+            "ip": r.client.host if r else "unknown"
+        }
+        QUERY_LOGS.append(log_entry)
+        
+        # Belleği şişirmemek için son 500 kaydı tut
+        if len(QUERY_LOGS) > 500: 
+            QUERY_LOGS.pop(0)
+            
         return {"success": True, **data, "remaining_credits": user["credits"]}
     
     return {"success": False, "error": data["error"]}
