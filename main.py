@@ -104,31 +104,76 @@ def fetch_imei_data(target_imei: str):
     }
     try:
         options = uc.ChromeOptions()
+        # --- BÜYÜ BURADA: ANTI-BOT GÜVENLİK DUVARI DELİCİ AYARLAR ---
         options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-dev-shm-usage")
-        driver = uc.Chrome(options=options, version_main=144)
-        wait = WebDriverWait(driver, 25)
+        options.add_argument("--disable-blink-features=AutomationControlled") # Ben bot değilim komutu
+        options.add_argument("--disable-infobars")
         
+        # Rastgele User-Agent atayarak her seferinde farklı bir PC gibi davranıyoruz
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0"
+        ]
+        options.add_argument(f"user-agent={random.choice(user_agents)}")
+        
+        # Tarayıcıyı başlat
+        driver = uc.Chrome(options=options, version_main=114) # Render'da sürüm uyuşmazlığı olmaması için esneklik
+        
+        # WebDriver gizleme (Cloudflare/F5 aşmak için zorunlu)
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+            Object.defineProperty(navigator, 'webdriver', {
+              get: () => undefined
+            })
+            """
+        })
+        
+        driver.set_page_load_timeout(30) # Sayfa 30 saniyede açılmazsa patlasın (Asılı kalmasın)
+        wait = WebDriverWait(driver, 20)
+        
+        # E-Devlet'e giriş
         driver.get("https://www.turkiye.gov.tr/imei-sorgulama")
-        wait.until(EC.visibility_of_element_located((By.ID, "txtImei"))).send_keys(target_imei)
         
+        # Rastgele insanvari bekleme (Botların saniyesinde işlem yapmasını WAF yakalar)
+        time.sleep(random.uniform(1.5, 3.0))
+        
+        # IMEI Kutusunu bul ve yaz
+        imei_input = wait.until(EC.presence_of_element_located((By.ID, "txtImei")))
+        # İnsan gibi tek tek yazma simülasyonu
+        for digit in target_imei:
+            imei_input.send_keys(digit)
+            time.sleep(random.uniform(0.05, 0.2))
+        
+        # Captcha var mı diye kontrol et
+        time.sleep(1)
         captcha_imgs = driver.find_elements(By.CLASS_NAME, "captchaImage")
         if captcha_imgs:
             code = solve_captcha(captcha_imgs[0].screenshot_as_base64)
-            if code: driver.find_element(By.NAME, "captcha_name").send_keys(code)
+            if code: 
+                # Harfleri büyük/küçük rastgele mi yazıyor diye e-devlet anlamasın diye temizle
+                clean_code = code.replace(" ", "").strip()
+                driver.find_element(By.NAME, "captcha_name").send_keys(clean_code)
         
+        # Çerez uyarısını kapat (Tıklamayı engellememesi için)
         driver.execute_script("var c=document.querySelector('.cookie-policy'); if(c) c.remove();")
-        submit_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input.submitButton")))
-        driver.execute_script("arguments[0].click();", submit_btn)
         
-        time.sleep(3)
+        # Butona tıkla
+        submit_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input.submitButton")))
+        driver.execute_script("arguments[0].scrollIntoView();", submit_btn) # Önce butona kaydır
+        time.sleep(0.5)
+        submit_btn.click() # Script ile değil gerçek tıklama (Bot korumasını aşar)
+        
+        # Sonucu bekle
+        time.sleep(random.uniform(3.0, 4.5))
         page_text = driver.find_element(By.TAG_NAME, "body").text
         
         if "Kayıt bulunamadı" in page_text:
             result["durum"] = "KAYIT BULUNAMADI"; result["renk"] = "red"
-        elif "Durum" in page_text:
+        elif "Durum" in page_text and "Marka/Model" in page_text:
             # --- DETAYLI VERİ AYIKLAMA ---
             d_match = re.search(r"Durum\n(.+)", page_text)
             if d_match: result["durum"] = d_match.group(1).strip()
@@ -144,13 +189,21 @@ def fetch_imei_data(target_imei: str):
 
             if result["durum"]:
                 if "KAYITLI" in result["durum"].upper(): result["renk"] = "green"
-                elif "ÇALINTI" in result["durum"].upper() or "YOLCU" in result["durum"].upper(): result["renk"] = "red"
+                elif "ÇALINTI" in result["durum"].upper() or "YOLCU" in result["durum"].upper() or "KLON" in result["durum"].upper(): result["renk"] = "red"
                 else: result["renk"] = "orange"
         else:
-            result["error"] = "Sistem şu an meşgul veya bot korumasına takıldı."
-    except Exception as e: result["error"] = str(e)
+            result["error"] = "Bot Koruması Aşılamadı veya E-Devlet Yanıt Vermiyor."
+            # Render loglarında görmek için hatayı ekrana bas
+            print("--- WAF / BOT ENGELİ ---")
+            print(f"Mevcut URL: {driver.current_url}")
+            print(f"Sayfa Başlığı: {driver.title}")
+            
+    except Exception as e: 
+        result["error"] = f"Tarayıcı Hatası: {str(e)}"
+        print(f"KRİTİK CATCH: {str(e)}")
     finally:
         if driver: driver.quit()
+        
     return result
 
 # ==============================================================================
